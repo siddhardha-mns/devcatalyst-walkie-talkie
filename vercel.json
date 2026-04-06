@@ -1,0 +1,9 @@
+{
+  "cleanUrls": true,
+  "rewrites": [
+    { "source": "/", "destination": "/client/index.html" },
+    { "source": "/assets/(.*)", "destination": "/client/assets/$1" },
+    { "source": "/sw.js", "destination": "/client/sw.js" },
+    { "source": "/(.*)", "destination": "/client/index.html" }
+  ]
+}
