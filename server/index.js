@@ -17,7 +17,7 @@ const io = new Server(server, {
 });
 
 // Serve static client files
-app.use(express.static(path.join(__dirname, "../client")));
+app.use(express.static(path.join(__dirname, "..")));
 
 // Room state
 const rooms = {}; // { roomId: { members: Set<socketId>, activeSpeaker: socketId|null } }
