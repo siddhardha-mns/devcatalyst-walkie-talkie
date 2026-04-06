@@ -619,13 +619,14 @@ let isConnected = false;
 // Audio
 let audioCtx = null;
 let mediaStream = null;
-let mediaRecorder = null;
+let processorNode = null; // Replacing MediaRecorder
 let keepAliveOscillator = null;
 let audioQueue = [];
 let isPlaying = false;
 let analyserNode = null;
 let micAnalyserNode = null;
 let animFrameId = null;
+let nextPlayTime = 0; // For seamless PCM playback
 
 // Service worker
 let swRegistration = null;
@@ -730,37 +731,35 @@ function startVolumeMeter(stream) {
 }
 
 // =============================================
-// AUDIO PLAYBACK — queue incoming Opus/chunks
+// AUDIO PLAYBACK — PCM jitter buffer
 // =============================================
 function enqueueAudioChunk(arrayBuffer) {
-  audioQueue.push(arrayBuffer);
-  if (!isPlaying) playNextChunk();
-}
+  if (!audioCtx) initAudioContext();
+  
+  // Convert Int16 back to Float32
+  const int16 = new Int16Array(arrayBuffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768.0;
+  }
 
-function playNextChunk() {
-  if (audioQueue.length === 0) { isPlaying = false; return; }
-  isPlaying = true;
-  const chunk = audioQueue.shift();
+  const buffer = audioCtx.createBuffer(1, float32.length, 16000); // Fixed 16kHz
+  buffer.copyToChannel(float32, 0);
 
-  resumeAudioCtx();
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(analyserNode);
+  if (!isMuted) source.connect(audioCtx.destination);
 
-  audioCtx.decodeAudioData(chunk.slice(0), (buffer) => {
-    const src = audioCtx.createBufferSource();
-    src.buffer = buffer;
-    src.connect(analyserNode);
-
-    if (!isMuted) src.connect(audioCtx.destination);
-
-    src.onended = playNextChunk;
-    src.start(0);
-  }, (err) => {
-    console.warn('[Audio] decode error', err);
-    playNextChunk();
-  });
+  // Synchronized playback
+  const now = audioCtx.currentTime;
+  if (nextPlayTime < now) nextPlayTime = now + 0.05; // Small buffer
+  source.start(nextPlayTime);
+  nextPlayTime += buffer.duration;
 }
 
 // =============================================
-// PTT — Push To Talk
+// PTT — PCM Based Streaming
 // =============================================
 async function startPTT(e) {
   if (e) e.preventDefault();
@@ -768,7 +767,6 @@ async function startPTT(e) {
 
   resumeAudioCtx();
 
-  // Request mic
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -784,38 +782,38 @@ async function startPTT(e) {
     return;
   }
 
-  // Tell server we want to speak
   socket.emit('ptt-start');
 }
 
 function startRecording() {
-  if (!mediaStream) return;
+  if (!mediaStream || !audioCtx) return;
 
   isSpeaking = true;
   document.getElementById('ptt-btn').classList.add('pressed');
   startVolumeMeter(mediaStream);
 
-  // Choose best codec
-  const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-    ? 'audio/webm;codecs=opus'
-    : MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
-      ? 'audio/ogg;codecs=opus'
-      : 'audio/webm';
+  const source = audioCtx.createMediaStreamSource(mediaStream);
+  processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
 
-  mediaRecorder = new MediaRecorder(mediaStream, {
-    mimeType,
-    audioBitsPerSecond: 16000,
-  });
+  source.connect(processorNode);
+  processorNode.connect(audioCtx.destination);
 
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data.size > 0 && socket && isConnected) {
-      e.data.arrayBuffer().then((buf) => {
-        socket.emit('audio-chunk', { chunk: buf, roomId: myRoom });
-      });
+  processorNode.onaudioprocess = (e) => {
+    if (!isSpeaking) return;
+    const input = e.inputBuffer.getChannelData(0);
+    const ratio = e.inputBuffer.sampleRate / 16000;
+    const newLength = Math.floor(input.length / ratio);
+    const result = new Int16Array(newLength);
+    
+    for (let i = 0; i < newLength; i++) {
+      const offset = Math.floor(i * ratio);
+      result[i] = Math.max(-1, Math.min(1, input[offset])) * 0x7FFF;
+    }
+    
+    if (socket && isConnected) {
+      socket.emit('audio-chunk', { chunk: result.buffer, roomId: myRoom });
     }
   };
-
-  mediaRecorder.start(150); // 150ms chunks
 }
 
 function stopPTT(e) {
@@ -826,8 +824,9 @@ function stopPTT(e) {
   document.getElementById('ptt-btn').classList.remove('pressed');
   document.getElementById('vol-bar').style.width = '0%';
 
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
+  if (processorNode) {
+    processorNode.disconnect();
+    processorNode = null;
   }
   if (mediaStream) {
     mediaStream.getTracks().forEach(t => t.stop());
